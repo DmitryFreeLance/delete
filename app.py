@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
+from requests import Session
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -30,6 +31,9 @@ class Config:
     target_group_id: int | None
     poll_timeout_sec: int
     request_timeout_sec: int
+    http_retry_attempts: int
+    http_retry_backoff_sec: float
+    heartbeat_sec: int
     get_updates_limit: int
     max_delete_per_cycle: int
     ignore_bot_messages: bool
@@ -50,6 +54,9 @@ class Config:
             target_group_id=target_group_id,
             poll_timeout_sec=env_int("POLL_TIMEOUT_SEC", 2),
             request_timeout_sec=env_int("REQUEST_TIMEOUT_SEC", 10),
+            http_retry_attempts=env_int("HTTP_RETRY_ATTEMPTS", 3),
+            http_retry_backoff_sec=float(os.getenv("HTTP_RETRY_BACKOFF_SEC", "0.7")),
+            heartbeat_sec=env_int("HEARTBEAT_SEC", 20),
             get_updates_limit=env_int("GET_UPDATES_LIMIT", 100),
             max_delete_per_cycle=env_int("MAX_DELETE_PER_CYCLE", 30),
             ignore_bot_messages=env_bool("IGNORE_BOT_MESSAGES", True),
@@ -106,11 +113,16 @@ class DeleteModerationBot:
     def __init__(self, config: Config):
         self.config = config
         self.db = DbGateway(config.db_path)
-        self.base_url = f"https://api.telegram.org/bot{config.bot_token}"
+        hosts_raw = os.getenv("TELEGRAM_API_HOSTS", "api.telegram.org").strip()
+        hosts = [h.strip() for h in hosts_raw.split(",") if h.strip()]
+        self.base_urls = [f"https://{host}/bot{config.bot_token}" for host in hosts]
+        self.base_url_idx = 0
+        self.session: Session = requests.Session()
         self.offset: int | None = None
         self.target_group_id: int | None = config.target_group_id
         self.last_group_refresh_monotonic = 0.0
         self.last_moderation_refresh_monotonic = 0.0
+        self.last_heartbeat_monotonic = 0.0
         self.group_moderation_enabled = True
 
         self.pending_heap: list[tuple[float, int, int, int, int]] = []
@@ -126,6 +138,7 @@ class DeleteModerationBot:
         while True:
             try:
                 self.refresh_runtime_settings()
+                self.maybe_emit_heartbeat()
                 self.process_due_deletions()
                 updates = self.get_updates()
                 for update in updates:
@@ -145,10 +158,47 @@ class DeleteModerationBot:
             self.group_moderation_enabled = self.db.is_group_moderation_enabled()
             self.last_moderation_refresh_monotonic = now
 
+    def maybe_emit_heartbeat(self) -> None:
+        now = time.monotonic()
+        if now - self.last_heartbeat_monotonic < self.config.heartbeat_sec:
+            return
+        pending = len(self.pending_heap)
+        logging.info(
+            "Heartbeat: group=%s moderation=%s pending_deletes=%s offset=%s host=%s",
+            self.target_group_id,
+            self.group_moderation_enabled,
+            pending,
+            self.offset,
+            self.base_urls[self.base_url_idx],
+        )
+        self.last_heartbeat_monotonic = now
+
+    def active_base_url(self) -> str:
+        return self.base_urls[self.base_url_idx]
+
+    def rotate_base_url(self) -> None:
+        if len(self.base_urls) <= 1:
+            return
+        self.base_url_idx = (self.base_url_idx + 1) % len(self.base_urls)
+        logging.warning("Switched Telegram host to %s", self.base_urls[self.base_url_idx])
+
     def api_call(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
-        url = f"{self.base_url}/{method}"
-        resp = requests.post(url, json=payload, timeout=self.config.request_timeout_sec)
-        return resp.json()
+        attempts = max(1, self.config.http_retry_attempts)
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            url = f"{self.active_base_url()}/{method}"
+            try:
+                resp = self.session.post(url, json=payload, timeout=self.config.request_timeout_sec)
+                return resp.json()
+            except requests.RequestException as e:
+                last_error = e
+                logging.warning("Telegram API request failed (%s/%s): %s", attempt, attempts, e)
+                self.rotate_base_url()
+                if attempt < attempts:
+                    time.sleep(self.config.http_retry_backoff_sec * attempt)
+
+        logging.error("Telegram API unavailable after retries: %s", last_error)
+        return {"ok": False, "description": f"network_error: {last_error}"}
 
     def get_updates(self) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {
