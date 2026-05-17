@@ -110,6 +110,13 @@ class DbGateway:
 
 
 class DeleteModerationBot:
+    VERIFICATION_BADGE_TEXTS = {
+        "проверена. реал",
+        "проверена. вирт",
+    }
+    BADGE_LINK_WINDOW_SEC = 15.0
+    POLICY_RETENTION_SEC = 120.0
+
     def __init__(self, config: Config):
         self.config = config
         self.db = DbGateway(config.db_path)
@@ -128,6 +135,8 @@ class DeleteModerationBot:
         self.pending_heap: list[tuple[float, int, int, int, int]] = []
         self.pending_keys: set[tuple[int, int]] = set()
         self.seq = 0
+        self.recent_message_policy: dict[tuple[int, int], tuple[float, bool]] = {}
+        self.last_user_message_key_by_chat: dict[int, tuple[int, int]] = {}
 
     def run(self) -> None:
         logging.info("Delete moderation bot started")
@@ -256,25 +265,96 @@ class DeleteModerationBot:
         if not isinstance(chat_id, int) or chat_id != self.target_group_id:
             return
 
+        self.cleanup_recent_message_policy()
+
         from_user = message.get("from") or {}
         user_id = from_user.get("id")
         if not isinstance(user_id, int):
-            return
-
-        if self.config.ignore_bot_messages and bool(from_user.get("is_bot")):
-            return
-
-        if self.db.is_admin(user_id):
-            return
-
-        if self.db.has_active_campaign(user_id):
             return
 
         message_id = message.get("message_id")
         if not isinstance(message_id, int):
             return
 
-        self.enqueue_delete(chat_id, message_id, 0.0, 0)
+        is_bot_message = bool(from_user.get("is_bot"))
+        if self.config.ignore_bot_messages and is_bot_message:
+            if self.should_delete_verification_badge(chat_id, message):
+                self.enqueue_delete(chat_id, message_id, 0.0, 0)
+            return
+
+        is_admin = self.db.is_admin(user_id)
+        has_active_campaign = False if is_admin else self.db.has_active_campaign(user_id)
+        should_delete_user_message = (not is_admin) and (not has_active_campaign)
+        self.remember_user_message_policy(chat_id, message_id, should_delete_user_message)
+        if should_delete_user_message:
+            self.enqueue_delete(chat_id, message_id, 0.0, 0)
+
+    @classmethod
+    def is_verification_badge_message(cls, message: dict[str, Any]) -> bool:
+        text = message.get("text")
+        if not isinstance(text, str):
+            return False
+        normalized = " ".join(text.strip().lower().split())
+        return normalized in cls.VERIFICATION_BADGE_TEXTS
+
+    def should_delete_verification_badge(self, chat_id: int, message: dict[str, Any]) -> bool:
+        if not self.is_verification_badge_message(message):
+            return False
+
+        now = time.time()
+        reply_to = message.get("reply_to_message") or {}
+        reply_from = reply_to.get("from") or {}
+        reply_user_id = reply_from.get("id")
+        if isinstance(reply_user_id, int):
+            is_admin = self.db.is_admin(reply_user_id)
+            if is_admin:
+                return False
+            if self.db.has_active_campaign(reply_user_id):
+                return False
+            return True
+
+        reply_message_id = reply_to.get("message_id")
+        if isinstance(reply_message_id, int):
+            key = (chat_id, reply_message_id)
+            decision = self.recent_message_policy.get(key)
+            if decision is not None:
+                seen_ts, should_delete = decision
+                if now - seen_ts <= self.BADGE_LINK_WINDOW_SEC:
+                    return should_delete
+
+        last_key = self.last_user_message_key_by_chat.get(chat_id)
+        if last_key is not None:
+            decision = self.recent_message_policy.get(last_key)
+            if decision is not None:
+                seen_ts, should_delete = decision
+                if now - seen_ts <= self.BADGE_LINK_WINDOW_SEC:
+                    return should_delete
+
+        # Fallback: if we cannot link the badge to a recent user post, keep old behavior.
+        return True
+
+    def remember_user_message_policy(self, chat_id: int, message_id: int, should_delete: bool) -> None:
+        key = (chat_id, message_id)
+        self.recent_message_policy[key] = (time.time(), should_delete)
+        self.last_user_message_key_by_chat[chat_id] = key
+
+    def cleanup_recent_message_policy(self) -> None:
+        now = time.time()
+        stale_keys = [
+            key
+            for key, (seen_ts, _) in self.recent_message_policy.items()
+            if now - seen_ts > self.POLICY_RETENTION_SEC
+        ]
+        for key in stale_keys:
+            self.recent_message_policy.pop(key, None)
+
+        stale_chats = [
+            chat_id
+            for chat_id, key in self.last_user_message_key_by_chat.items()
+            if key not in self.recent_message_policy
+        ]
+        for chat_id in stale_chats:
+            self.last_user_message_key_by_chat.pop(chat_id, None)
 
     def enqueue_delete(self, chat_id: int, message_id: int, due_ts: float, attempt: int) -> None:
         key = (chat_id, message_id)
