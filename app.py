@@ -110,10 +110,12 @@ class DbGateway:
 
 
 class DeleteModerationBot:
-    VERIFICATION_BADGE_TEXTS = {
+    VERIFICATION_BADGE_PREFIXES = (
         "проверена. реал",
         "проверена. вирт",
-    }
+        "проверена реал",
+        "проверена вирт",
+    )
     BADGE_LINK_WINDOW_SEC = 15.0
     POLICY_RETENTION_SEC = 120.0
 
@@ -293,9 +295,11 @@ class DeleteModerationBot:
     def is_verification_badge_message(cls, message: dict[str, Any]) -> bool:
         text = message.get("text")
         if not isinstance(text, str):
+            text = message.get("caption")
+        if not isinstance(text, str):
             return False
         normalized = " ".join(text.strip().lower().split())
-        return normalized in cls.VERIFICATION_BADGE_TEXTS
+        return normalized.startswith(cls.VERIFICATION_BADGE_PREFIXES)
 
     def should_delete_verification_badge(self, chat_id: int, message: dict[str, Any]) -> bool:
         if not self.is_verification_badge_message(message):
